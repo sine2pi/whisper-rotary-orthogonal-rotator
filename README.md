@@ -79,9 +79,14 @@ Preliminary results for orthogonal rotary embedding (audio encoder)
 {'loss': 12.7979, 'grad_norm': 8.748061180114746, 'learning_rate': 0.0003303584245557274, 'epoch': 0.75}
 
 {'loss': 17.6141, 'grad_norm': 29.942426681518555, 'learning_rate': 0.00021576038982537167, 'epoch': 0.8}
+
 {'loss': 15.4772, 'grad_norm': 5.808310031890869, 'learning_rate': 0.00012356316355018038, 'epoch': 0.85}
+
 {'loss': 12.527, 'grad_norm': 6.470815658569336, 'learning_rate': 5.603694742609982e-05, 'epoch': 0.9}
+
 {'loss': 15.274, 'grad_norm': 13.315616607666016, 'learning_rate': 1.4844461000767696e-05, 'epoch': 0.95}
+
 {'loss': 13.9642, 'grad_norm': 8.09641170501709, 'learning_rate': 1e-06, 'epoch': 1.0}
+
 {'train_runtime': 40.2698, 'train_samples_per_second': 2.483, 'train_steps_per_second': 2.483, 'train_loss': 23.43394317626953, 'epoch': 1.0}
 
