@@ -3,13 +3,21 @@ Preliminary results for orthogonal rotary embedding (audio encoder)
 use_rotation_dynamics=False
  
 {'loss': 482.1581, 'grad_norm': 372.06085205078125, 'learning_rate': 0.002236155538999232, 'epoch': 0.05}
+
 {'loss': 351.5755, 'grad_norm': 307.7116394042969, 'learning_rate': 0.0021949630525739, 'epoch': 0.1}
+
 {'loss': 221.4291, 'grad_norm': 305.3424987792969, 'learning_rate': 0.0021274368364498195, 'epoch': 0.15}
+
 {'loss': 163.0654, 'grad_norm': 141.87852478027344, 'learning_rate': 0.002035239610174628, 'epoch': 0.2}
+
 {'loss': 122.7977, 'grad_norm': 118.95207977294922, 'learning_rate': 0.0019206415754442715, 'epoch': 0.25}
+
 {'loss': 104.0978, 'grad_norm': 77.01026153564453, 'learning_rate': 0.0017864645162028853, 'epoch': 0.3}
+
 {'loss': 94.4483, 'grad_norm': 108.65161895751953, 'learning_rate': 0.0016360123169571195, 'epoch': 0.35}
+
 {'loss': 85.452, 'grad_norm': 115.34065246582031, 'learning_rate': 0.0014729896101746277, 'epoch': 0.4}
+
 {'loss': 78.417, 'grad_norm': 49.82068634033203, 'learning_rate': 0.0013014105559377392, 'epoch': 0.45}
 {'loss': 75.2952, 'grad_norm': 48.50209426879883, 'learning_rate': 0.0011254999999999998, 'epoch': 0.5}
 {'loss': 64.8844, 'grad_norm': 69.6558609008789, 'learning_rate': 0.0009495894440622602, 'epoch': 0.55}
