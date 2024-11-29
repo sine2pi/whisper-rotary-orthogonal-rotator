@@ -1,3 +1,35 @@
+## Combining Rotary Positional Embeddings with Orthogonal Rotations for Enhanced Transformer Performance
+
+### Abstract
+We propose a novel approach that combines Rotary Positional Embeddings (RoPE) with orthogonal rotation matrices to enhance the performance of transformer models. Preliminary results demonstrate significant improvements in model accuracy and loss reduction, indicating the potential of this technique to improve positional encoding in sequence modeling tasks.
+
+Rotary Positional Embeddings (RoPE) have shown promise in providing relative positional information. Here we explore the integration of orthogonal rotations to further enrich these embeddings, aiming to leverage both global and local positional context.
+
+### Methodology
+We start with the standard RoPE method, where the positional information is incorporated by rotating the queries and keys based on their relative positions. To this, we add an orthogonal rotation matrix, which independently rotates each layer of the encoded input. This combination provides a richer, multi-layered positional encoding. Think of it as rotating the layers of a rubics cube compared to rotating the entire cube.
+
+The main steps are as follows:
+1. **Standard RoPE**: \( q' = R(m-n) \cdot q \) and \( k' = R(m-n) \cdot k \), where \( R(m-n) \) is the rotation matrix based on the relative position.
+2. **Orthogonal Rotation**: Apply an orthogonal rotation matrix \( O \):
+   - \( q'' = O \cdot q' \)
+   - \( k'' = O \cdot k' \)
+
+These doubly-rotated vectors \( q'' \) and \( k'' \) are then used in the attention calculation.
+
+### Preliminary Results
+The combined approach was tested on a transformer model using the Whisper architecture. The initial loss and subsequent learning curve showed marked improvement compared to the standard RoPE approach:
+
+- **Starting Loss**: The model with orthogonal rotations starts with a lower initial loss.
+- **Convergence Rate**: Consistently maintains a lower loss throughout training.
+- **Final Loss**: Ends with a lower final loss, indicating better overall learning.
+
+### Conclusion
+Combining RoPE with orthogonal rotations provides a richer and more effective positional encoding. This approach not only stabilizes the initial learning process but also improves overall model performance. Future work will involve more extensive testing across different datasets and exploring the theoretical underpinnings of this improvement.
+
+### Acknowledgements
+Special thanks to the open-source community and the developers of the Whisper architecture.
+
+
 Preliminary results for orthogonal rotary embedding (audio encoder)
 
 # use_rotation_dynamics=False
