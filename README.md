@@ -23,11 +23,9 @@ The combined approach was tested on a transformer model using the Whisper archit
 - **Convergence Rate**: Consistently maintains a lower loss throughout training.
 - **Final Loss**: Ends with a lower final loss, indicating better overall learning.
 
-### Conclusion
 Combining RoPE with orthogonal rotations provides a richer and more effective positional encoding. This approach not only stabilizes the initial learning process but also improves overall model performance. Future work will involve more extensive testing across different datasets and exploring the theoretical underpinnings of this improvement.
 
-### Acknowledgements
-Special thanks to the open-source community and the developers of the Whisper architecture.
+
 
 
 Preliminary results for orthogonal rotary embedding (audio encoder)
