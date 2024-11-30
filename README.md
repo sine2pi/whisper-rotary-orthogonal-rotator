@@ -1,6 +1,5 @@
 ## Combining Rotary Positional Embeddings with Orthogonal Rotations for Enhanced Transformer Performance
 
-### Abstract
 We propose a novel approach that combines Rotary Positional Embeddings (RoPE) with orthogonal rotation matrices to enhance the performance of transformer models. Preliminary results demonstrate significant improvements in model accuracy and loss reduction, indicating the potential of this technique to improve positional encoding in sequence modeling tasks.
 
 Rotary Positional Embeddings (RoPE) have shown promise in providing relative positional information. Here we explore the integration of orthogonal rotations to further enrich these embeddings, aiming to leverage both global and local positional context.
@@ -24,9 +23,6 @@ The combined approach was tested on a transformer model using the Whisper archit
 - **Final Loss**: Ends with a lower final loss, indicating better overall learning.
 
 Combining RoPE with orthogonal rotations provides a richer and more effective positional encoding. This approach not only stabilizes the initial learning process but also improves overall model performance. Future work will involve more extensive testing across different datasets and exploring the theoretical underpinnings of this improvement.
-
-
-
 
 Preliminary results for orthogonal rotary embedding (audio encoder)
 
