@@ -143,3 +143,87 @@ class MultiHeadAttention(nn.Module):
             qk = qk.detach()
 
         return out, qk
+
+###### encoder
+
+
+class AudioEncoder(nn.Module):
+    def __init__(self, n_mels: int, n_ctx: int, n_state: int, n_head: int, n_layer: int, checkpointing=False):
+        super().__init__()
+        self.conv1 = nn.Conv1d(n_mels, n_state, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv1d(n_state, n_state, kernel_size=3, stride=2, padding=1)
+        self.positional_embedding = LearnedSinusoidalEmbeddings(n_ctx, n_state, checkpointing=checkpointing)
+        self.rotor_layer = RotaryEmbeddingWithRotation(n_state, n_head)
+        self.checkpointing = checkpointing
+
+        self.blocks = nn.ModuleList(
+            [ResidualAttentionBlock(n_state, n_head, checkpointing=checkpointing) for _ in range(n_layer)]
+        )
+        self.ln_post = LayerNorm(n_state)
+
+    def forward(self, x: torch.Tensor):
+        x = F.gelu(self.conv1(x))
+        x = F.gelu(self.conv2(x))
+        
+        x = x.permute(0, 2, 1)
+
+        x = self.rotor_layer(x)
+        
+        pos_emb = self.positional_embedding(torch.arange(x.size(1), device=x.device)).unsqueeze(0)
+        x = x + pos_emb
+
+        for block in self.blocks:
+            if self.checkpointing:
+                x = checkpoint(block, x)
+            else:
+                x = block(x)
+
+        x = self.ln_post(x)
+        return x
+
+####### Decoder
+
+class TextDecoder(nn.Module):
+    def __init__(self, n_vocab, n_ctx, n_state, n_head, n_layer, checkpointing=False):
+        super().__init__()
+        self.token_embedding = nn.Embedding(n_vocab, n_state)
+        self.positional_embedding = LearnedSinusoidalEmbeddings(n_ctx, n_state, checkpointing=checkpointing)
+        self.rotor_layer = RotaryEmbeddingWithRotation(n_state, n_head)
+        self.checkpointing = checkpointing
+        self.n_head = n_head
+
+        self.blocks = nn.ModuleList([
+            ResidualAttentionBlock(n_state, n_head, cross_attention=True, checkpointing=checkpointing)
+            for _ in range(n_layer)
+        ])
+        self.ln = LayerNorm(n_state)
+        mask = torch.empty(n_ctx, n_ctx).fill_(-np.inf).triu_(1)
+        self.register_buffer("mask", mask, persistent=False)
+
+    def forward(self, x: torch.Tensor, xa: torch.Tensor, kv_cache: Optional[dict] = None):
+        offset = next(iter(kv_cache.values())).shape[1] if kv_cache else 0
+        positions = torch.arange(x.shape[1], device=x.device) + offset
+        pos_emb = self.positional_embedding(positions).unsqueeze(0)
+
+        x = self.token_embedding(x) + pos_emb
+        x = x.to(xa.dtype)
+
+        batch_size, seq_length, embedding_dim = x.shape
+        num_heads = self.n_head
+        head_dim = embedding_dim // num_heads
+        x = x.view(batch_size, seq_length, num_heads, head_dim)
+
+        x = self.rotor_layer(x)
+        x = x.view(batch_size, seq_length, embedding_dim)
+
+        for block in self.blocks:
+            if self.checkpointing:
+                x = checkpoint(block, x, xa, self.mask, kv_cache)
+            else:
+                x = block(x, xa, self.mask, kv_cache)
+
+        x = self.ln(x)
+        logits = (x @ torch.transpose(self.token_embedding.weight.to(x.dtype), 0, 1)).float()
+
+        return logits
+
