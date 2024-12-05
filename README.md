@@ -1,118 +1,45 @@
-## Combining Rotary Positional Embeddings with Orthogonal Rotations for Enhanced Transformer Performance
+Dynamic Base Adjustment
+Self-Adjusting Parameters: The model dynamically adjusts the base parameter in response to training loss, optimizing positional embeddings in real-time. This adaptive mechanism enhances the model's ability to fine-tune itself during training, ensuring better performance and efficiency.
 
-We propose a novel approach that combines Rotary Positional Embeddings (RoPE) with orthogonal rotation matrices to enhance the performance of transformer models. Preliminary results demonstrate significant improvements in model accuracy and loss reduction, indicating the potential of this technique to improve positional encoding in sequence modeling tasks.
+RotaryEmbeddingWithRotation
+Orthogonally Initialized Rotation Matrix: This component combines rotary embeddings with an orthogonally initialized rotation matrix, providing robust and stable positional embeddings. This novel approach enhances the model’s capacity to represent positional information effectively.
 
-Rotary Positional Embeddings (RoPE) have shown promise in providing relative positional information. Here we explore the integration of orthogonal rotations to further enrich these embeddings, aiming to leverage both global and local positional context.
+LearnedSinusoidalEmbeddings
+Learned Sinusoidal Embeddings with Checkpointing: This unique integration of sinusoidal embeddings with optional checkpointing helps manage memory efficiently during training while maintaining stable embedding magnitudes through L2 normalization.
 
-### Methodology
-We start with the standard RoPE method, where the positional information is incorporated by rotating the queries and keys based on their relative positions. To this, we add an orthogonal rotation matrix, which independently rotates each layer of the encoded input. This combination provides a richer, multi-layered positional encoding. Think of it as rotating the layers of a rubics cube compared to rotating the entire cube.
+MultiHeadAttention
+Dynamic Positional Bias: Supports rotary embeddings and includes relative positional bias, capturing dependencies effectively. The attention mechanism is finely tuned with a dynamically adjustable base parameter, providing flexibility and precision.
 
-The main steps are as follows:
-1. **Standard RoPE**: \( q' = R(m-n) \cdot q \) and \( k' = R(m-n) \cdot k \), where \( R(m-n) \) is the rotation matrix based on the relative position.
-2. **Orthogonal Rotation**: Apply an orthogonal rotation matrix \( O \):
-   - \( q'' = O \cdot q' \)
-   - \( k'' = O \cdot k' \)
+HybridAttention
+Combining Local and Global Attention: This component leverages both local and global attention mechanisms, ensuring that the model captures both fine-grained and broad context. The sliding window approach for local attention enhances its ability to process long sequences efficiently.
 
-These doubly-rotated vectors \( q'' \) and \( k'' \) are then used in the attention calculation.
+DynamicConvAttention
+Integrating Convolution and Attention: This component enriches feature representation by combining convolutional layers with attention mechanisms, enabling the model to extract local context while attending to global information simultaneously.
 
-### Preliminary Results
-The combined approach was tested on a transformer model using the Whisper architecture. The initial loss and subsequent learning curve showed marked improvement compared to the standard RoPE approach:
+Model Components
+LayerNorm: Custom normalization with gamma and beta parameters.
 
-- **Starting Loss**: The model with orthogonal rotations starts with a lower initial loss.
-- **Convergence Rate**: Consistently maintains a lower loss throughout training.
-- **Final Loss**: Ends with a lower final loss, indicating better overall learning.
+Linear: Custom linear layer with batch normalization and various activation functions.
 
-Combining RoPE with orthogonal rotations provides a richer and more effective positional encoding. This approach not only stabilizes the initial learning process but also improves overall model performance. Future work will involve more extensive testing across different datasets and exploring the theoretical underpinnings of this improvement.
+Conv1d: Custom 1D convolution layer with Kaiming initialization.
 
-Preliminary results for orthogonal rotary embedding (audio encoder)
+RotaryEmbeddingWithRotation: Orthogonally initialized rotary embeddings with dynamic base adjustment.
 
-# use_rotation_dynamics=False
- 
-{'loss': 482.1581, 'grad_norm': 372.06085205078125, 'learning_rate': 0.002236155538999232, 'epoch': 0.05}
+LearnedSinusoidalEmbeddings: Sinusoidal embeddings with optional checkpointing and L2 normalization.
 
-{'loss': 351.5755, 'grad_norm': 307.7116394042969, 'learning_rate': 0.0021949630525739, 'epoch': 0.1}
+MultiHeadAttention: Dynamic positional bias with rotary embeddings and optional caching.
 
-{'loss': 221.4291, 'grad_norm': 305.3424987792969, 'learning_rate': 0.0021274368364498195, 'epoch': 0.15}
+ResidualAttentionBlock: Integrates self and cross-attention with GELU-activated MLP.
 
-{'loss': 163.0654, 'grad_norm': 141.87852478027344, 'learning_rate': 0.002035239610174628, 'epoch': 0.2}
+AudioEncoder: Convolutional layers with learned sinusoidal embeddings and rotary embeddings.
 
-{'loss': 122.7977, 'grad_norm': 118.95207977294922, 'learning_rate': 0.0019206415754442715, 'epoch': 0.25}
+TextDecoder: Token embeddings with rotary embeddings and cross-attention.
 
-{'loss': 104.0978, 'grad_norm': 77.01026153564453, 'learning_rate': 0.0017864645162028853, 'epoch': 0.3}
+DynamicConvAttention: Combines convolution and attention for enriched feature extraction.
 
-{'loss': 94.4483, 'grad_norm': 108.65161895751953, 'learning_rate': 0.0016360123169571195, 'epoch': 0.35}
-
-{'loss': 85.452, 'grad_norm': 115.34065246582031, 'learning_rate': 0.0014729896101746277, 'epoch': 0.4}
-
-{'loss': 78.417, 'grad_norm': 49.82068634033203, 'learning_rate': 0.0013014105559377392, 'epoch': 0.45}
-
-{'loss': 75.2952, 'grad_norm': 48.50209426879883, 'learning_rate': 0.0011254999999999998, 'epoch': 0.5}
-
-{'loss': 64.8844, 'grad_norm': 69.6558609008789, 'learning_rate': 0.0009495894440622602, 'epoch': 0.55}
-
-{'loss': 68.3513, 'grad_norm': 77.75894927978516, 'learning_rate': 0.0007780103898253718, 'epoch': 0.6}
-
-{'loss': 66.594, 'grad_norm': 37.12736892700195, 'learning_rate': 0.0006149876830428796, 'epoch': 0.65}
-
-{'loss': 60.0386, 'grad_norm': 65.30926513671875, 'learning_rate': 0.00046453548379711405, 'epoch': 0.7}
-
-{'loss': 64.5896, 'grad_norm': 61.09320831298828, 'learning_rate': 0.0003303584245557274, 'epoch': 0.75}
-
-{'loss': 60.5629, 'grad_norm': 115.98933410644531, 'learning_rate': 0.00021576038982537167, 'epoch': 0.8}
-
-{'loss': 62.3663, 'grad_norm': 47.13294982910156, 'learning_rate': 0.00012356316355018038, 'epoch': 0.85}
-
-{'loss': 67.5187, 'grad_norm': 52.122432708740234, 'learning_rate': 5.603694742609982e-05, 'epoch': 0.9}
-
-{'loss': 57.235, 'grad_norm': 78.41802978515625, 'learning_rate': 1.4844461000767696e-05, 'epoch': 0.95}
-
-{'loss': 64.2939, 'grad_norm': 61.09769821166992, 'learning_rate': 1e-06, 'epoch': 1.0}
-
-{'train_runtime': 35.8005, 'train_samples_per_second': 2.793, 'train_steps_per_second': 2.793, 'train_loss': 120.75853576660157, 'epoch': 1.0}
+HybridAttention: Merges local and global attention mechanisms using sliding window and multi-head attention.
 
 
-
-# use_rotation_dynamics=True
-
-{'loss': 121.6713, 'grad_norm': 51.660587310791016, 'learning_rate': 0.002236155538999232, 'epoch': 0.05}
-
-{'loss': 40.5575, 'grad_norm': 37.445674896240234, 'learning_rate': 0.0021949630525739, 'epoch': 0.1}
-
-{'loss': 30.6873, 'grad_norm': 76.93095397949219, 'learning_rate': 0.0021274368364498195, 'epoch': 0.15}
-
-{'loss': 19.4515, 'grad_norm': 18.017181396484375, 'learning_rate': 0.002035239610174628, 'epoch': 0.2}
-
-{'loss': 20.4378, 'grad_norm': 16.686138153076172, 'learning_rate': 0.0019206415754442715, 'epoch': 0.25}
-
-{'loss': 20.7134, 'grad_norm': 7.736686706542969, 'learning_rate': 0.0017864645162028853, 'epoch': 0.3}
-
-{'loss': 16.6393, 'grad_norm': 17.803098678588867, 'learning_rate': 0.0016360123169571195, 'epoch': 0.35}
-
-{'loss': 16.6182, 'grad_norm': 25.761716842651367, 'learning_rate': 0.0014729896101746277, 'epoch': 0.4}
-
-{'loss': 16.8209, 'grad_norm': 4.993704795837402, 'learning_rate': 0.0013014105559377392, 'epoch': 0.45}
-
-{'loss': 15.6543, 'grad_norm': 5.196218967437744, 'learning_rate': 0.0011254999999999998, 'epoch': 0.5}
-
-{'loss': 17.8063, 'grad_norm': 10.519207954406738, 'learning_rate': 0.0009495894440622602, 'epoch': 0.55}
-
-{'loss': 15.4852, 'grad_norm': 12.229737281799316, 'learning_rate': 0.0007780103898253718, 'epoch': 0.6}
-
-{'loss': 12.6701, 'grad_norm': 4.160615921020508, 'learning_rate': 0.0006149876830428796, 'epoch': 0.65}
-
-{'loss': 15.8113, 'grad_norm': 9.614446640014648, 'learning_rate': 0.00046453548379711405, 'epoch': 0.7}
-
-{'loss': 12.7979, 'grad_norm': 8.748061180114746, 'learning_rate': 0.0003303584245557274, 'epoch': 0.75}
-
-{'loss': 17.6141, 'grad_norm': 29.942426681518555, 'learning_rate': 0.00021576038982537167, 'epoch': 0.8}
-
-{'loss': 15.4772, 'grad_norm': 5.808310031890869, 'learning_rate': 0.00012356316355018038, 'epoch': 0.85}
-
-{'loss': 12.527, 'grad_norm': 6.470815658569336, 'learning_rate': 5.603694742609982e-05, 'epoch': 0.9}
-
-{'loss': 15.274, 'grad_norm': 13.315616607666016, 'learning_rate': 1.4844461000767696e-05, 'epoch': 0.95}
-
-{'loss': 13.9642, 'grad_norm': 8.09641170501709, 'learning_rate': 1e-06, 'epoch': 1.0}
 
 {'train_runtime': 40.2698, 'train_samples_per_second': 2.483, 'train_steps_per_second': 2.483, 'train_loss': 23.43394317626953, 'epoch': 1.0}
 
