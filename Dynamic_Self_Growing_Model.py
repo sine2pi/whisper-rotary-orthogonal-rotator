@@ -45,7 +45,7 @@ class DynamicSelfGrowingModel(nn.Module):
         while len(self.layers) < layers_count:
             self.add_layer()
 
-#### training loop
+#### training loop ideas
 
 def train_dynamic_model(model, train_loader, criterion, optimizer, save_path, num_epochs=100):
     for epoch in range(num_epochs):
@@ -81,4 +81,49 @@ optimizer = optim.Adam(model.parameters(), lr=0.001)
 train_loader = ...  # Your training data loader
 
 train_dynamic_model(model, train_loader, criterion, optimizer, save_path)
+
+
+
+def train_dynamic_model(model, train_loader, criterion, optimizer, save_path, num_epochs=100):
+    for epoch in range(num_epochs):
+        total_loss = 0
+        for inputs, targets in train_loader:
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+            loss.backward()
+            optimizer.step()
+            total_loss += loss.item()
+        
+        average_loss = total_loss / len(train_loader)
+        model.training_history.append(average_loss)
+        
+        # Dynamic layer adjustment logic
+        if len(model.training_history) > 10:
+            recent_losses = model.training_history[-10:]
+            if average_loss > max(recent_losses):
+                print(f"Adding layer at epoch {epoch}, total layers: {len(model.layers) + 1}")
+                model.add_layer()
+            elif average_loss < min(recent_losses):
+                print(f"Removing layer at epoch {epoch}, total layers: {len(model.layers) - 1}")
+                model.remove_layer()
+        
+        # Save model state
+        model.save_state(save_path)
+        
+        print(f"Epoch [{epoch+1}/{num_epochs}], Loss: {average_loss}")
+
+# Example usage
+input_dim = 1024
+hidden_dim = 512
+output_dim = 10
+save_path = "dynamic_model_checkpoint.pt"
+
+model = DynamicModel(input_dim, hidden_dim, output_dim)
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.Adam(model.parameters(), lr=0.001)
+train_loader = ...  # Your training data loader
+
+train_dynamic_model(model, train_loader, criterion, optimizer, save_path)
+
 
