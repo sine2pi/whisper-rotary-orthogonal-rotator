@@ -104,33 +104,21 @@ class GivensRotations(nn.Module):
         self.thetas = nn.Parameter(torch.zeros(num_rotations))
 
     def forward(self, x):
-        if x.dim() == 3:
-            batch_size, seq_len, n_state = x.size()
-        elif x.dim() == 4:
-            batch_size, seq_len, n_head, h_dim = x.size()
-            n_state = n_head * h_dim
-            x = x.view(batch_size, seq_len, n_state)
-        else:
-            raise ValueError(f"Expected input tensor to be 3D or 4D, but got {x.dim()}D")
-
-        print(f"Initial shape: {x.shape}")
-        print(f"Expected n_state: {self.h_dim}, Actual n_state: {n_state}")
-
-        if n_state != self.h_dim:
-            raise ValueError(f"Expected n_state of {self.h_dim}, but got {n_state}")
-
-        x = x.view(-1, n_state)  # Flatten for matrix multiplication
-
+        if x.dim() != 4:
+            raise ValueError(f"Expected input tensor to be 4D, but got {x.dim()}D")
+        
+        batch_size, seq_len, n_head, h_dim = x.size()
+        
+        if h_dim != self.h_dim:
+            raise ValueError(f"Expected h_dim of {self.h_dim}, but got {h_dim}")
+        
+        x = x.view(-1, h_dim) 
         for k in range(self.num_rotations):
             i, j = k % self.h_dim, (k + 1) % self.h_dim
             G = givens_rotation_matrix(self.h_dim, i, j, self.thetas[k])
             x = torch.matmul(x, G.to(x.device))
-
-        x = x.view(batch_size, seq_len, n_state)  # Reshape back to 3D
-
-        if x.dim() == 4:
-            x = x.view(batch_size, seq_len, n_head, h_dim)
-
+        
+        x = x.view(batch_size, seq_len, n_head, h_dim)  
         return x
 
 class BiasedCrossAttention(nn.Module):
