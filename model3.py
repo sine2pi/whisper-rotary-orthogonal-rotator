@@ -1,46 +1,29 @@
 
-import os
-import evaluate
-import json
-import logging
-import random
-import sys
-import time
-import torch
-import transformers
-import warnings
-import math
-import neologdn
+import base64, gzip, torch, evaluate, math, os, sys, time
 import gzip
-import base64
-import numpy as np
-import torch.nn as nn
-import torch.nn.functional as F
 from torch import amp, Tensor, optim
 from torch.utils.checkpoint import checkpoint
-from torch.optim import Adamax
-from torch.utils.tensorboard import SummaryWriter
-from typing import Optional, Tuple, Dict, List, Any, Union
+from contextlib import contextmanager
 from dataclasses import dataclass
-from transformers import (
-    WhisperPreTrainedModel, WhisperConfig, Trainer, 
-    TrainingArguments, WhisperTokenizer, WhisperFeatureExtractor, 
-    WhisperProcessor, TrainerCallback, Seq2SeqTrainer, Seq2SeqTrainingArguments, AutoTokenizer
-)
 from transformers.models.whisper.modeling_whisper import WhisperPreTrainedModel
 from transformers.models.whisper.generation_whisper import WhisperGenerationMixin
 from transformers.optimization import Adafactor, AdafactorSchedule
 from huggingface_hub import PyTorchModelHubMixin
-from datasets import load_from_disk, load_dataset
-from tqdm import tqdm
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
-from sklearn.model_selection import train_test_split
+from datasets import IterableDatasetDict, Audio, load_dataset
+import numpy as np
+import torch, transformers, warnings
+from typing import Dict, Iterable, Optional, Tuple, Union, List, Any, Type
+import torch.nn.functional as F
+from torch import Tensor, nn
+import torchaudio, torchaudio.transforms as T
+from transformers import Seq2SeqTrainer, TrainerCallback, Seq2SeqTrainingArguments, WhisperTokenizer, WhisperForConditionalGeneration, WhisperConfig, WhisperProcessor, WhisperFeatureExtractor, WhisperTokenizer, WhisperForConditionalGeneration
 from whisper.decoding import decode as decode_function
 from whisper.decoding import detect_language as detect_language_function
 from whisper.transcribe import transcribe as transcribe_function
 
 try:
     from torch.nn.functional import scaled_dot_product_attention
+
     SDPA_AVAILABLE = True
 except (ImportError, RuntimeError, OSError):
     scaled_dot_product_attention = None
@@ -50,6 +33,8 @@ transformers.utils.logging.set_verbosity_error()
 warnings.filterwarnings(action="ignore")
 warnings.warn = lambda *args,**kwargs: None
 device = "cuda"
+
+
 
 class LayerNorm(nn.Module):
     def __init__(self, num_features, eps=1e-6):
@@ -121,39 +106,6 @@ class Conv1d(nn.Conv1d):
         weight = self.weight.to(x.dtype)
         bias = None if self.bias is None else self.bias.to(x.dtype)
         return super()._conv_forward(x, weight, bias)
-
-def givens_rotation_matrix(n_state, i, j, theta):
-    G = torch.eye(n_state)
-    G[i, i] = math.cos(theta)
-    G[i, j] = -math.sin(theta)
-    G[j, i] = math.sin(theta)
-    G[j, j] = math.cos(theta)
-    return G
-
-class GivensRotations(nn.Module):
-    def __init__(self, h_dim, num_rotations):
-        super().__init__()
-        self.h_dim = h_dim
-        self.num_rotations = num_rotations
-        self.thetas = nn.Parameter(torch.zeros(num_rotations))
-
-    def forward(self, x):
-        if x.dim() != 4:
-            raise ValueError(f"Expected input tensor to be 4D, but got {x.dim()}D")
-        
-        batch_size, seq_len, n_head, h_dim = x.size()
-        
-        if h_dim != self.h_dim:
-            raise ValueError(f"Expected h_dim of {self.h_dim}, but got {h_dim}")
-        
-        x = x.view(-1, h_dim) 
-        for k in range(self.num_rotations):
-            i, j = k % self.h_dim, (k + 1) % self.h_dim
-            G = givens_rotation_matrix(self.h_dim, i, j, self.thetas[k])
-            x = torch.matmul(x, G.to(x.device))
-        
-        x = x.view(batch_size, seq_len, n_head, h_dim)  
-        return x
 
 class BiasedCrossAttention(nn.Module):
     def __init__(self, n_state, n_head, dropout_rate=0.1):
@@ -266,7 +218,40 @@ class HybridAttention(nn.Module):
             output[i:end, :, :] = attn_output[:end - i, :, :]
 
         return output
-    
+
+def givens_rotation_matrix(n_state, i, j, theta):
+    G = torch.eye(n_state)
+    G[i, i] = math.cos(theta)
+    G[i, j] = -math.sin(theta)
+    G[j, i] = math.sin(theta)
+    G[j, j] = math.cos(theta)
+    return G
+
+class GivensRotations(nn.Module):
+    def __init__(self, h_dim, num_rotations):
+        super().__init__()
+        self.h_dim = h_dim
+        self.num_rotations = num_rotations
+        self.thetas = nn.Parameter(torch.zeros(num_rotations))
+
+    def forward(self, x):
+        if x.dim() != 4:
+            raise ValueError(f"Expected input tensor to be 4D, but got {x.dim()}D")
+        
+        batch_size, seq_len, n_head, h_dim = x.size()
+        
+        if h_dim != self.h_dim:
+            raise ValueError(f"Expected h_dim of {self.h_dim}, but got {h_dim}")
+        
+        x = x.view(-1, h_dim) 
+        for k in range(self.num_rotations):
+            i, j = k % self.h_dim, (k + 1) % self.h_dim
+            G = givens_rotation_matrix(self.h_dim, i, j, self.thetas[k])
+            x = torch.matmul(x, G.to(x.device))
+        
+        x = x.view(batch_size, seq_len, n_head, h_dim)  
+        return x
+
 class RotaryEmbeddingWithRotation(nn.Module):
     def __init__(self, n_state, n_head, base=10000, checkpointing=False):
         super().__init__()
@@ -690,8 +675,7 @@ class Echo(WhisperPreTrainedModel, PyTorchModelHubMixin):
 
         self.update_base(new_base)
         self.best_loss = loss
-        #print(f"Adjusted base: {new_base}")
-
+        # print(f"Adjusted base: {new_base}")
 
     @staticmethod
     def shift_tokens_right(input_ids, pad_token_id, decoder_start_token_id) -> torch.Tensor:
@@ -825,20 +809,15 @@ class Echo(WhisperPreTrainedModel, PyTorchModelHubMixin):
         outputs = self.decoder(decoder_input_ids, encoder_outputs)
         return outputs.argmax(dim=-1)
 
-#rasa
-
-
-feature_extractor = WhisperFeatureExtractor.from_pretrained("openai/whisper-small", sampling_rate=16000, n_fft=1024, hop_length=256, feature_size=128, do_normalize=True)
-tokenizer = WhisperTokenizer.from_pretrained("openai/whisper-small", language='ja', task='transcribe')#, pad_token="[PAD]", unk_token="[UNK]", model_max_length=1024)
-processor = WhisperProcessor.from_pretrained("openai/whisper-small", tokenizer=tokenizer, feature_extractor=feature_extractor)
-
+tokenizer = WhisperTokenizer.from_pretrained("openai/whisper-small", language="japanese", task="transcribe")
+processor = WhisperProcessor.from_pretrained("openai/whisper-small", language="japanese", task="transcribe")
 
 config = WhisperConfig(
-    n_mels=128,
+    n_mels=80,
     n_audio_ctx=1500,
     n_audio_state=1024,
     n_audio_head=16,
-    n_audio_layer=24,
+    n_audio_layer=20,
     vocab_size=(len(tokenizer)),
     n_text_ctx=448,
     n_text_state=1024,
@@ -852,204 +831,109 @@ config = WhisperConfig(
 
 model = Echo(config).to(device)
 model.apply_initialization()
-model.save_pretrained("./models/echo2")
 
 
+class CustomCallback(TrainerCallback):
+    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+        print(f"Evaluation metrics at step {state.global_step}: {metrics}")
 
-from datetime import datetime
-log_dir = os.path.join('./output/', datetime.now().strftime('%Y-%m-%d_%H-%M-%S'))
-os.makedirs(log_dir, exist_ok=True)
+raw_datasets = IterableDatasetDict()
 
-optimizer = transformers.Adafactor(model.parameters(), 
-                                clip_threshold=0.99, 
-                                weight_decay=0.005, 
-                                scale_parameter=True, 
-                                relative_step=True, 
-                                warmup_init=True, 
-                                lr=None)
+raw_datasets["train"] = load_dataset("mozilla-foundation/common_voice_17_0", "ja", split="train", trust_remote_code=True, streaming=True)
+raw_datasets["test"] = load_dataset("mozilla-foundation/common_voice_17_0", "ja", split="test", trust_remote_code=True, streaming=True).take(100)
 
-scheduler = transformers.optimization.AdafactorSchedule(optimizer, initial_lr=2.25e-5)
-loss_fn = torch.nn.CrossEntropyLoss(ignore_index=-100)
+raw_datasets = raw_datasets.cast_column("audio", Audio(sampling_rate=16000))
 
-ds_a = load_from_disk("D:/proj/datasets/gvjas")["train"].to_iterable_dataset(num_shards=200).filter(lambda sample: bool(sample["sentence"])).map(lambda sample: {"sentence": neologdn.normalize(sample['sentence'], repeat=1)}).shuffle(buffer_size=10000)
-ds_b = load_from_disk("D:/proj/datasets/gvjas")["test"].to_iterable_dataset(num_shards=20).filter(lambda sample: bool(sample["sentence"])).map(lambda sample: {"sentence": neologdn.normalize(sample['sentence'], repeat=1)}).shuffle(buffer_size=100)
+tokenizer = WhisperTokenizer.from_pretrained("openai/whisper-small", language="japanese", task="transcribe")
+processor = WhisperProcessor.from_pretrained("openai/whisper-small", language="japanese", task="transcribe")
 
 def prepare_dataset(batch):
     audio = batch["audio"]
-    batch["input_features"] = feature_extractor(audio["array"], sampling_rate=audio["sampling_rate"]).input_features[0]
-    batch["labels"] = tokenizer(batch["sentence"]).input_ids
+    batch["input_features"] = processor.feature_extractor(audio["array"], sampling_rate=audio["sampling_rate"]).input_features[0]
+    transcription = batch["sentence"]
+    batch["labels"] = processor.tokenizer(transcription).input_ids
     return batch
 
-train = ds_a.map(prepare_dataset).select_columns(["input_features", "labels"])
-test = ds_b.map(prepare_dataset).select_columns(["input_features", "labels"])
+vectorized_datasets = raw_datasets.map(prepare_dataset, remove_columns=list(next(iter(raw_datasets.values())).features)).with_format("torch")
 
 @dataclass
 class DataCollatorSpeechSeq2SeqWithPadding:
     processor: Any
-    tokenizer: Any
-    feature_extractor: Any
-    decoder_start_token_id: Any
 
     def __call__(self, features: List[Dict[str, Union[List[int], torch.Tensor]]]) -> Dict[str, torch.Tensor]:
         input_features = [{"input_features": feature["input_features"]} for feature in features]
-        batch = self.feature_extractor.pad(input_features, return_tensors="pt")
+        batch = self.processor.feature_extractor.pad(input_features, return_tensors="pt")
         label_features = [{"input_ids": feature["labels"]} for feature in features]
-        labels_batch = self.tokenizer.pad(label_features, return_tensors="pt")
+        labels_batch = self.processor.tokenizer.pad(label_features, return_tensors="pt")
         labels = labels_batch["input_ids"].masked_fill(labels_batch.attention_mask.ne(1), -100)
-        if (labels[:, 0] == self.decoder_start_token_id).all().cpu().item():
+        if (labels[:, 0] == self.processor.tokenizer.bos_token_id).all().cpu().item():
             labels = labels[:, 1:]
         batch["labels"] = labels
         return batch
+    
+data_collator = DataCollatorSpeechSeq2SeqWithPadding(processor=processor)
 
-data_collator = DataCollatorSpeechSeq2SeqWithPadding(processor=processor, tokenizer=tokenizer, feature_extractor=feature_extractor, decoder_start_token_id=model.config.decoder_start_token_id)
+metric = evaluate.load("cer")
 
-class GradientClippingCallback(TrainerCallback):
-    def on_step_end(self, args, state, control, **kwargs):
-        torch.nn.utils.clip_grad_norm_(kwargs["model"].parameters(), max_norm=0.95)
+def compute_metrics(pred):
+    pred_logits = pred.predictions
+    label_ids = pred.label_ids
 
-class MetricsCallback(TrainerCallback):
-    def __init__(self, tb_writer, tokenizer, metric, log_every_n_steps=30):
-        super().__init__()
-        self.tb_writer = tb_writer
-        self.tokenizer = tokenizer
-        self.metric = metric
-        self.log_every_n_steps = log_every_n_steps
-        self.predictions = None
-        self.label_ids = None
+    if isinstance(pred_logits, tuple):
+        pred_ids = pred_logits[0]
+    else:
+        pred_ids = pred_logits
+    if pred_ids.ndim == 3:
+        pred_ids = np.argmax(pred_ids, axis=-1)
 
-    def compute_cer(self, pred_str, label_str):
-        cer = 100 * self.metric.compute(predictions=pred_str, references=label_str)
-        return cer
-
-    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
-        if metrics is not None:
-            for key, value in metrics.items():
-                if key.startswith("eval_"):
-                    self.tb_writer.add_scalar(key, value, state.global_step)
-                    print(f"Step {state.global_step} - {key}: {value}")
-
-        if self.predictions is not None and self.label_ids is not None:
-            pred_str = self.tokenizer.batch_decode(self.predictions, skip_special_tokens=True)
-            label_str = self.tokenizer.batch_decode(self.label_ids, skip_special_tokens=True)
-
-            sample_index = 1
-            self.tb_writer.add_text("Prediction", pred_str[sample_index], state.global_step)
-            self.tb_writer.add_text("Label", label_str[sample_index], state.global_step)
-
-            print(f"Step {state.global_step} - Sample Prediction: {pred_str[sample_index]}")
-            print(f"Step {state.global_step} - Sample Label: {label_str[sample_index]}")
-
-        self.predictions = None
-        self.label_ids = None
-
-def create_compute_metrics(callback_instance):
-    def compute_metrics(eval_pred):
-        pred_logits = eval_pred.predictions
-        label_ids = eval_pred.label_ids
-
-        if isinstance(pred_logits, tuple):
-            pred_ids = pred_logits[0]
-        else:
-            pred_ids = pred_logits
-        if pred_ids.ndim == 3:
-            pred_ids = np.argmax(pred_ids, axis=-1)
-
-        label_ids[label_ids == -100] = callback_instance.tokenizer.pad_token_id
-        callback_instance.predictions = pred_ids
-        callback_instance.label_ids = label_ids
-
-        pred_str = callback_instance.tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
-        label_str = callback_instance.tokenizer.batch_decode(label_ids, skip_special_tokens=True)
-        cer = 100 * callback_instance.metric.compute(predictions=pred_str, references=label_str)
-
-        pred_flat = pred_ids.flatten()
-        labels_flat = label_ids.flatten()
-        mask = labels_flat != callback_instance.tokenizer.pad_token_id
-
-        accuracy = accuracy_score(labels_flat[mask], pred_flat[mask])
-        precision = precision_score(labels_flat[mask], pred_flat[mask], average='weighted', zero_division=0)
-        recall = recall_score(labels_flat[mask], pred_flat[mask], average='weighted', zero_division=0)
-        f1 = f1_score(labels_flat[mask], pred_flat[mask], average='weighted', zero_division=0)
-
-        return {
-            "cer": cer,
-            "accuracy": accuracy,
-            "precision": precision,
-            "recall": recall,
-            "f1": f1
-        }
-    return compute_metrics
+    label_ids[label_ids == -100] = tokenizer.pad_token_id
+    pred_str = tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
+    label_str = tokenizer.batch_decode(label_ids, skip_special_tokens=True)
+    cer = 100 * metric.compute(predictions=pred_str, references=label_str)
+    return {"cer": cer}
 
 training_args = Seq2SeqTrainingArguments(
-    output_dir=log_dir,
-    logging_dir=log_dir,
-    overwrite_output_dir=True,
-    per_device_train_batch_size=1, 
+    output_dir="./test",  
+    per_device_train_batch_size=1,
+    per_device_eval_batch_size=1,
     gradient_accumulation_steps=1,
     eval_accumulation_steps=1,
     num_train_epochs=1,
     tf32=True,
     bf16=True,
-    max_steps=10000,
-    save_steps=1000,
-    eval_steps=20,
-    eval_strategy="steps",
-    eval_on_start=False,
-    warmup_steps=100,
-    logging_steps=10,
-    logging_strategy="steps",
-    save_strategy="steps",
+    learning_rate=1e-5,
+    # warmup_steps=500,
+    evaluation_strategy="steps",
+    # predict_with_generate=True,
+    # generation_max_length=225,
+    max_steps=100,
+    save_steps=100,
+    eval_steps=10,
+    logging_steps=5,
     report_to=["tensorboard"],
-    push_to_hub=False,
-    remove_unused_columns=False,
-    label_names=["labels"],
-    hub_private_repo=True,
-    metric_for_best_model="cer",
-    greater_is_better=False,
     load_best_model_at_end=True,
+    metric_for_best_model="wer",
+    greater_is_better=False,
+    push_to_hub=False,
     optim="adafactor",
-    weight_decay=0.00025,
+    weight_decay=0.0025,
     disable_tqdm=False,
     save_total_limit=2,
-    use_cpu=False,
-    torch_empty_cache_steps=10
-    
+    torch_empty_cache_steps=10,
 )
-
-torch.backends.cuda.matmul.allow_tf32 = True
-torch.backends.cudnn.allow_tf32 = True
-torch.cuda.empty_cache()
-torch.cuda.set_device(0)
-
-cer_metric = evaluate.load("cer")
-tb_writer = SummaryWriter(log_dir)
-
-metrics_callback = MetricsCallback(tb_writer, tokenizer, cer_metric, log_every_n_steps=30)
-compute_metrics = create_compute_metrics(metrics_callback)
 
 trainer = Seq2SeqTrainer(
     args=training_args,
     model=model,
-    train_dataset=train,
-    eval_dataset=test,
+    train_dataset=vectorized_datasets["train"],
+    eval_dataset=vectorized_datasets["test"],
     data_collator=data_collator,
-    tokenizer=processor.feature_extractor,
     compute_metrics=compute_metrics,
-    callbacks=[metrics_callback]
+    tokenizer=processor,
 )
 
+trainer.add_callback(CustomCallback)
 
-
-
-trainer.train(resume_from_checkpoint=True)
-tb_writer.close()
-from torch.utils.tensorboard import SummaryWriter
-
-
-path = "./models/echo2_4k"
-model.save_pretrained(path)
-processor.save_pretrained(path)
-tokenizer.save_pretrained(path)
-feature_extractor.save_pretrained(path)
+trainer.train()
 
 
