@@ -19,6 +19,7 @@ Integrating Convolution and Attention: This component enriches feature represent
 
 
 Rotation block output tensor:
+
 $$ \mathbf{x}{\text{transformed}} = \mathbf{x} \cdot \left( \prod{k=1}^{N} G_k \right) \cdot R $$
 
 Applying the Combined Rotary Embedding, Givens Rotation Matrix, and Rotary Orthogonal Matrix transformations to a tensor can improve the model's performance in several ways:
