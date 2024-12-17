@@ -1,6 +1,15 @@
 
 import base64, gzip, torch, evaluate, math, os, sys, time
 import gzip
+import collections
+import copy
+import functools
+from functools import partial, wraps
+from threading import Thread
+import gc
+import importlib.metadata
+import inspect
+import itertools
 from torch import amp, Tensor, optim
 from torch.utils.checkpoint import checkpoint
 from contextlib import contextmanager
@@ -32,9 +41,87 @@ except (ImportError, RuntimeError, OSError):
 transformers.utils.logging.set_verbosity_error()
 warnings.filterwarnings(action="ignore")
 warnings.warn = lambda *args,**kwargs: None
-device = "cuda"
+
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+dtype = torch.float32
 
 
+
+### Model ###
+class CombinedRotaryEmbedding(nn.Module):
+    def __init__(self, n_state, n_head, num_rotations, base=10000, checkpointing=False):
+        super().__init__()
+        self.n_state = n_state
+        self.n_head = n_head
+        self.h_dim = n_state // n_head
+        self.num_rotations = num_rotations
+        self.base = base
+        self.checkpointing = checkpointing
+        
+        self.thetas = nn.Parameter(torch.zeros(num_rotations))
+        self.rotation_pairs = nn.Parameter(torch.rand(num_rotations, 2) * self.h_dim)
+
+        self.rotation_matrix = nn.Parameter(torch.eye(self.h_dim))
+        
+        self.inv_freq = nn.Parameter(1.0 / (self.base ** (torch.arange(0, self.h_dim, 2).float() / self.h_dim)))
+    
+    def givens_rotation_matrix(self, n_state, i, j, theta):
+        G = torch.eye(n_state, device=theta.device)
+        G[i, i] = math.cos(theta)
+        G[i, j] = -math.sin(theta)
+        G[j, i] = math.sin(theta)
+        G[j, j] = math.cos(theta)
+        return G
+    
+    def update_base(self, new_base):
+        self.base = new_base
+        self.inv_freq = nn.Parameter(1.0 / (self.base ** (torch.arange(0, self.h_dim, 2).float() / self.h_dim)))
+    
+    def reset_parameters(self):
+        nn.init.orthogonal_(self.rotation_matrix)
+        nn.init.zeros_(self.thetas)
+    
+    def forward(self, x):
+        if self.checkpointing:
+            return checkpoint(self._forward, x)
+        else:
+            return self._forward(x)
+    
+    def _forward(self, x):
+        if x.dim() not in [3, 4]:
+            raise ValueError(f"Expected input tensor to be 3D or 4D, but got {x.dim()}D")
+        
+        if x.dim() == 3:
+            batch_size, seq_len, n_state = x.size()
+            x = x.view(batch_size, seq_len, self.n_head, self.h_dim)
+        else:
+            batch_size, seq_len, n_head, h_dim = x.size()
+            if n_head != self.n_head or h_dim != self.h_dim:
+                raise ValueError(f"Expected n_head {self.n_head} and h_dim {self.h_dim}, but got n_head {n_head} and h_dim {h_dim}")
+        
+        x = x.reshape(-1, self.h_dim)
+        
+        for k in range(self.num_rotations):
+            i, j = self.rotation_pairs[k].long()
+            theta = self.thetas[k]
+            G = self.givens_rotation_matrix(self.h_dim, i, j, theta)
+            x = torch.matmul(x, G)
+        
+        x = torch.matmul(x, self.rotation_matrix)
+        
+        x = x.view(batch_size, seq_len, self.n_head, self.h_dim)
+        
+        sinusoid_inp = torch.einsum('i, j -> i j', torch.arange(seq_len, device=x.device), self.inv_freq)
+        sin = sinusoid_inp.sin()[None, :, None, :]
+        cos = sinusoid_inp.cos()[None, :, None, :]
+        
+        x1, x2 = x[..., ::2], x[..., 1::2]
+        x = torch.cat([x1 * cos - x2 * sin, x1 * sin + x2 * cos], dim=-1)
+        
+        x = x.view(batch_size, seq_len, self.n_state)
+        
+        return x
 
 class LayerNorm(nn.Module):
     def __init__(self, num_features, eps=1e-6):
@@ -49,10 +136,8 @@ class LayerNorm(nn.Module):
         x = (x - mean) / (std + self.eps)
         return self.gamma * x + self.beta
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
 class Linear(nn.Module):
-    def __init__(self, in_features: int, out_features: int, dropout_rate = 0.01, use_batchnorm: bool = True, activation: str = 'relu'):
+    def __init__(self, in_features: int, out_features: int, dropout_rate = 0.001, use_batchnorm: bool = True, activation: str = 'relu'):
         super(Linear, self).__init__()
         self.linear = nn.Linear(in_features, out_features)
         self.dropout = nn.Dropout(dropout_rate)
@@ -108,7 +193,7 @@ class Conv1d(nn.Conv1d):
         return super()._conv_forward(x, weight, bias)
 
 class BiasedCrossAttention(nn.Module):
-    def __init__(self, n_state, n_head, dropout_rate=0.1):
+    def __init__(self, n_state, n_head, dropout_rate=0.001):
         super().__init__()
         self.n_head = n_head
         self.n_state = n_state
@@ -142,7 +227,7 @@ class BiasedCrossAttention(nn.Module):
         return out
 
 class DynamicConvAttention(nn.Module):
-    def __init__(self, n_state, n_head, kernel_size=3, dropout_rate=0.1):
+    def __init__(self, n_state, n_head, kernel_size=3, dropout_rate=0.001):
         super().__init__()
         self.n_state = n_state
         self.n_head = n_head
@@ -182,7 +267,7 @@ class DynamicConvAttention(nn.Module):
         return self.out_proj(self.dropout(combined_out)) + x.permute(0, 2, 1)
 
 class HybridAttention(nn.Module):
-    def __init__(self, n_state, n_head, window_size=1, dropout_rate=0.1):
+    def __init__(self, n_state, n_head, window_size=1, dropout_rate=0.001):
         super().__init__()
         self.local_attn = nn.MultiheadAttention(n_state, n_head, dropout=dropout_rate)
         self.global_attn = nn.MultiheadAttention(n_state, n_head, dropout=dropout_rate)
@@ -253,12 +338,12 @@ class GivensRotations(nn.Module):
         return x
 
 class RotaryEmbeddingWithRotation(nn.Module):
-    def __init__(self, n_state, n_head, base=10000, checkpointing=False):
+    def __init__(self, n_state, n_head, checkpointing=False, base=10000):
         super().__init__()
         self.n_state = n_state
         self.n_head = n_head
         self.h_dim = n_state // n_head
-        self.base = base  # Initialize base
+        self.base = base
         self.checkpointing = checkpointing
 
         self.rotation_matrix = nn.Parameter(torch.eye(self.h_dim))
@@ -334,7 +419,7 @@ class LearnedSinusoidalEmbeddings(nn.Module):
 class MultiHeadAttention(nn.Module):
     use_sdpa = True
 
-    def __init__(self, n_state: int, n_head: int, base: int = 10000, max_rel_dist: int = 1):
+    def __init__(self, n_state: int, n_head: int, max_rel_dist: int = 1, base: int = 10000):
         super().__init__()
         assert n_state % n_head == 0, "n_state must be divisible by n_head"
         self.n_head = n_head
@@ -505,13 +590,22 @@ class ResidualAttentionBlock(nn.Module):
         return x
 
 class AudioEncoder(nn.Module):
-    def __init__(self, n_mels: int, n_ctx: int, n_state: int, n_head: int, n_layer: int, max_rel_dist, checkpointing=False):
+    def __init__(self, n_mels: int, n_ctx: int, n_state: int, n_head: int, n_layer: int, max_rel_dist = 1, cross_attention=True, checkpointing=False, base=10000):
         super().__init__()
         self.conv1 = nn.Conv1d(n_mels, n_state, kernel_size=3, padding=1)
         self.conv2 = nn.Conv1d(n_state, n_state, kernel_size=3, stride=2, padding=1)
         self.positional_embedding = LearnedSinusoidalEmbeddings(n_ctx, n_state, checkpointing=checkpointing)
         self.rotary_embedding = RotaryEmbeddingWithRotation(n_state, n_head, base=10000)
         self.checkpointing = checkpointing
+        self.h_dim = n_state // n_head
+
+        self.combined_rotary = CombinedRotaryEmbedding(
+            n_state=n_state,
+            n_head=n_head,
+            num_rotations=self.h_dim // 2,
+            base=base,
+            checkpointing=False 
+        )
 
         self.blocks = nn.ModuleList(
             [ResidualAttentionBlock(n_state, n_head, max_rel_dist, checkpointing=checkpointing) for _ in range(n_layer)]
@@ -545,20 +639,32 @@ class AudioEncoder(nn.Module):
         x = F.gelu(self.conv1(x))
         x = F.gelu(self.conv2(x))
         x = x.permute(0, 2, 1)
-        x = self.rotary_embedding(x)
+
+        x = self.combined_rotary(x)
+        # x = self.rotary_embedding(x)
         
         pos_emb = self.positional_embedding(torch.arange(x.size(1), device=x.device)).unsqueeze(0)
         x = x + pos_emb
         return x
 
 class TextDecoder(nn.Module):
-    def __init__(self, vocab_size, n_ctx, n_state, n_head, n_layer, max_rel_dist, cross_attention, checkpointing=False):
+    def __init__(self, vocab_size, n_ctx, n_state, n_head, n_layer, max_rel_dist = 1, cross_attention=True, checkpointing=False, base=10000):
         super().__init__()
         self.token_embedding = nn.Embedding(vocab_size, n_state)
         self.positional_embedding = LearnedSinusoidalEmbeddings(n_ctx, n_state, checkpointing=checkpointing)
         self.rotary_embedding = RotaryEmbeddingWithRotation(n_state, n_head, base=10000)
         self.checkpointing = checkpointing
         self.n_head = n_head
+        self.h_dim = n_state // n_head
+        
+        self.combined_rotary = CombinedRotaryEmbedding(
+            n_state=n_state,
+            n_head=n_head,
+            num_rotations=self.h_dim // 2, 
+            base=base,
+            checkpointing=False  
+        )
+
 
         self.blocks = nn.ModuleList([
             ResidualAttentionBlock(n_state, n_head, max_rel_dist, cross_attention, checkpointing=checkpointing)
@@ -606,7 +712,9 @@ class TextDecoder(nn.Module):
         head_dim = embedding_dim // num_heads
         x = x.view(batch_size, seq_length, num_heads, head_dim)
 
-        x = self.rotary_embedding(x)
+        x = self.combined_rotary(x)
+        # x = self.rotary_embedding(x)
+
         x = x.view(batch_size, seq_length, embedding_dim)
         return x
     
@@ -617,20 +725,6 @@ class Echo(WhisperPreTrainedModel, PyTorchModelHubMixin):
         super().__init__(config)
         self.config = config
 
-        self.n_mels = self.config.num_mel_bins
-        self.n_audio_ctx = self.config.max_source_positions
-        self.n_audio_state = self.config.d_model
-        self.n_audio_head = self.config.encoder_attention_heads
-        self.n_audio_layer = self.config.encoder_layers
-        self.vocab_size = self.config.vocab_size
-        self.n_text_ctx = self.config.max_target_positions
-        self.n_text_state = self.config.d_model
-        self.n_text_head = self.config.decoder_attention_heads
-        self.n_text_layer = self.config.decoder_layers
-        self.max_rel_dist = self.config.max_rel_dist 
-        self.checkpointing = self.config.checkpointing
-        self.base = self.config.base
-
         self.encoder = AudioEncoder(
             self.config.n_mels,
             self.config.n_audio_ctx,
@@ -638,7 +732,9 @@ class Echo(WhisperPreTrainedModel, PyTorchModelHubMixin):
             self.config.n_audio_head,
             self.config.n_audio_layer,
             self.config.checkpointing,
-            self.config.max_rel_dist
+            self.config.max_rel_dist,
+            self.config.cross_attention,
+            self.config.base,
         )
         self.decoder = TextDecoder(
             self.config.vocab_size,
@@ -647,7 +743,9 @@ class Echo(WhisperPreTrainedModel, PyTorchModelHubMixin):
             self.config.n_text_head,
             self.config.n_text_layer,
             self.config.checkpointing,
-            self.config.max_rel_dist
+            self.config.max_rel_dist,
+            self.config.cross_attention,
+            self.config.base,
         )
 
         all_heads = torch.zeros(self.config.n_text_layer, self.config.n_text_head, dtype=torch.bool)
@@ -706,9 +804,6 @@ class Echo(WhisperPreTrainedModel, PyTorchModelHubMixin):
         return {
             "loss": loss,
             "logits": logits,
-            "input_features": encoded_features,
-            "labels": labels,
-            "decoder_input_ids": dec_input_ids
         }
 
     def _initialize_weights(self):
@@ -809,6 +904,26 @@ class Echo(WhisperPreTrainedModel, PyTorchModelHubMixin):
         outputs = self.decoder(decoder_input_ids, encoder_outputs)
         return outputs.argmax(dim=-1)
 
+    def gradient_checkpointing_enable(self, gradient_checkpointing_kwargs=None):
+            if not self.supports_gradient_checkpointing:
+                raise ValueError(f"{self.__class__.__name__} does not support gradient checkpointing.")
+
+            if gradient_checkpointing_kwargs is None:
+                gradient_checkpointing_kwargs = {"use_reentrant": True}
+
+            gradient_checkpointing_func = functools.partial(checkpoint, **gradient_checkpointing_kwargs)
+
+            _is_using_old_format = "value" in inspect.signature(self._set_gradient_checkpointing).parameters
+
+            if not _is_using_old_format:
+                self._set_gradient_checkpointing(enable=True, gradient_checkpointing_func=gradient_checkpointing_func)
+            else:
+                self.apply(partial(self._set_gradient_checkpointing, value=True))
+
+            if getattr(self, "_hf_peft_config_loaded", False):
+                self.enable_input_require_grads()
+
+
 tokenizer = WhisperTokenizer.from_pretrained("openai/whisper-small", language="japanese", task="transcribe")
 processor = WhisperProcessor.from_pretrained("openai/whisper-small", language="japanese", task="transcribe")
 
@@ -817,21 +932,31 @@ config = WhisperConfig(
     n_audio_ctx=1500,
     n_audio_state=1024,
     n_audio_head=16,
-    n_audio_layer=20,
-    vocab_size=(len(tokenizer)),
+    n_audio_layer=24,
+    vocab_size=51865,
     n_text_ctx=448,
     n_text_state=1024,
     n_text_head=16,
-    n_text_layer=16,
-    max_rel_dist=10,
+    n_text_layer=20,
+    max_rel_dist=15,
     cross_attention=True,
     checkpointing=True,
-    base=10000
+    base=10000,
+    bos_token_id = 50257,
+    eos_token_id = 50257,
+    pad_token_id = 50257,
+    decoder_start_token_id = 50258,
+    is_encoder_decoder = True,
+    init_std=0.02,
     )
 
 model = Echo(config).to(device)
 model.apply_initialization()
+model.save_pretrained("./models/echo2")
+model = Echo.from_pretrained("./models/echo2")
 
+
+## Train with Huggingface Trainer
 
 class CustomCallback(TrainerCallback):
     def on_evaluate(self, args, state, control, metrics=None, **kwargs):
@@ -839,7 +964,7 @@ class CustomCallback(TrainerCallback):
 
 raw_datasets = IterableDatasetDict()
 
-raw_datasets["train"] = load_dataset("mozilla-foundation/common_voice_17_0", "ja", split="train", trust_remote_code=True, streaming=True)
+raw_datasets["train"] = load_dataset("mozilla-foundation/common_voice_17_0", "ja", split="train", trust_remote_code=True, streaming=True)  # set split="train+validation" for low-resource
 raw_datasets["test"] = load_dataset("mozilla-foundation/common_voice_17_0", "ja", split="test", trust_remote_code=True, streaming=True).take(100)
 
 raw_datasets = raw_datasets.cast_column("audio", Audio(sampling_rate=16000))
@@ -902,17 +1027,17 @@ training_args = Seq2SeqTrainingArguments(
     tf32=True,
     bf16=True,
     learning_rate=1e-5,
-    # warmup_steps=500,
+    warmup_steps=100,
     evaluation_strategy="steps",
     # predict_with_generate=True,
     # generation_max_length=225,
-    max_steps=100,
-    save_steps=100,
-    eval_steps=10,
+    max_steps=1000,
+    save_steps=1000,
+    eval_steps=50,
     logging_steps=5,
     report_to=["tensorboard"],
     load_best_model_at_end=True,
-    metric_for_best_model="wer",
+    metric_for_best_model="cer",
     greater_is_better=False,
     push_to_hub=False,
     optim="adafactor",
@@ -935,5 +1060,7 @@ trainer = Seq2SeqTrainer(
 trainer.add_callback(CustomCallback)
 
 trainer.train()
+
+import tensorboard
 
 
